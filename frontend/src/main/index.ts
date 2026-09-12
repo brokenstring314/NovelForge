@@ -1,4 +1,6 @@
-import { app, shell, BrowserWindow, session, ipcMain, type WebPreferences } from 'electron'
+import { app, shell, BrowserWindow, session, ipcMain, dialog, type WebPreferences } from 'electron'
+import { spawn, type ChildProcess, type StdioOptions } from 'child_process'
+import { existsSync, mkdirSync, openSync } from 'fs'
 import { dirname, join, resolve } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
@@ -17,6 +19,72 @@ const backendPort = loadBackendPort({
     : [resolve(app.getAppPath(), '../backend/.env'), resolve(process.cwd(), 'backend/.env')]
 })
 const backendOrigin = `http://127.0.0.1:${backendPort}`
+
+// ============ 打包版后端进程管理 ============
+// 打包后由主进程负责拉起后端；开发模式仍由开发者自行启动后端，这里不做处理。
+let backendProcess: ChildProcess | null = null
+
+function resolveBackendExecutable(): { executable: string; workingDir: string } | null {
+  const fileName = process.platform === 'win32' ? 'NovelForgeBackend.exe' : 'NovelForgeBackend'
+  const directories = [
+    join(dirname(process.execPath), 'backend'), // Windows：与主程序同级
+    resolve(process.resourcesPath, '../backend'), // macOS：Contents/backend
+    join(process.resourcesPath, 'backend') // macOS：Contents/Resources/backend
+  ]
+  for (const dir of directories) {
+    // 同时兼容 PyInstaller 的 onedir 布局：backend/NovelForgeBackend/NovelForgeBackend
+    for (const candidate of [join(dir, fileName), join(dir, 'NovelForgeBackend', fileName)]) {
+      if (existsSync(candidate)) return { executable: candidate, workingDir: dir }
+    }
+  }
+  return null
+}
+
+function startPackagedBackend(): void {
+  const backend = resolveBackendExecutable()
+  if (!backend) {
+    dialog.showErrorBox('NovelForge', '未找到后端程序，请重新下载完整安装包。')
+    return
+  }
+  const env: NodeJS.ProcessEnv = { ...process.env, APP_PORT: String(backendPort) }
+  if (process.platform === 'darwin') {
+    // macOS：数据库放到用户目录，避免写进 .app 内部（更新/替换应用后数据不丢）
+    const dataDir = join(app.getPath('userData'), 'data')
+    mkdirSync(dataDir, { recursive: true })
+    env.NOVELFORGE_DB_PATH = join(dataDir, 'novelforge.db')
+  }
+  let stdio: StdioOptions = 'ignore'
+  try {
+    const logFd = openSync(join(app.getPath('userData'), 'backend.log'), 'a')
+    stdio = ['ignore', logFd, logFd]
+  } catch {
+    // 日志文件不可用时不阻塞启动
+  }
+  backendProcess = spawn(backend.executable, [], { cwd: backend.workingDir, env, stdio })
+  backendProcess.on('exit', (code) => console.log(`[backend] exited with code ${code}`))
+  backendProcess.on('error', (error) => console.error('[backend] failed to start:', error))
+}
+
+function stopPackagedBackend(): void {
+  if (backendProcess && !backendProcess.killed) {
+    backendProcess.kill()
+    backendProcess = null
+  }
+}
+
+async function waitForBackend(timeoutMs = 90_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch(`${backendOrigin}/`)
+      if (response.ok) return true
+    } catch {
+      // 后端尚未就绪，继续重试
+    }
+    await new Promise((done) => setTimeout(done, 500))
+  }
+  return false
+}
 
 function webPreferences(): WebPreferences {
   return {
@@ -98,9 +166,20 @@ function openIdeasHome() {
 // This method will be called when Electron has finished
 // initialization and is ready to create browser windows.
 // Some APIs can only be used after this event occurs.
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   // Set app user model id for windows
   electronApp.setAppUserModelId('com.novelforge.app')
+
+  // 打包版：先拉起后端并等它就绪，再创建窗口，避免界面加载时连不上
+  if (app.isPackaged) {
+    startPackagedBackend()
+    if (!(await waitForBackend())) {
+      dialog.showErrorBox(
+        'NovelForge',
+        `后端服务启动超时。\n日志文件：${join(app.getPath('userData'), 'backend.log')}`
+      )
+    }
+  }
 
   // Default open or close DevTools by F12 in development
   // and ignore CommandOrControl + R in production.
@@ -151,6 +230,11 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {
     app.quit()
   }
+})
+
+// 退出时回收后端进程
+app.on('will-quit', () => {
+  stopPackagedBackend()
 })
 
 // In this file you can include the rest of your app's specific main process

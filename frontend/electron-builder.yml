@@ -37,7 +37,12 @@ extraMetadata:
   OriginalFilename: NovelForge.exe
 # 移除 NSIS 安装器相关配置（仅保留便携版）
 mac:
-  entitlementsInherit: build/entitlements.mac.plist
+  icon: build/icon.icns
+  entitlements: resources/entitlements.mac.plist
+  entitlementsInherit: resources/entitlements.mac.plist
+  # 无开发者证书：跳过 electron-builder 的签名，改由 CI 在打包后做 ad-hoc 签名
+  identity: null
+  hardenedRuntime: false
   extendInfo:
     - NSCameraUsageDescription: Application requests access to the device's camera.
     - NSMicrophoneUsageDescription: Application requests access to the device's microphone.

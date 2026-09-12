@@ -63,6 +63,7 @@ backend/migrate_db.py
 backend/dist
 backend/build
 *.spec
+!backend/NovelForgeBackend.spec
 *.sh
 *.mako
 

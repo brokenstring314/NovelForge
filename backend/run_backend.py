@@ -37,4 +37,4 @@ from main import app
 from app.core import settings
  
 if __name__ == "__main__":
-	run(app, host="0.0.0.0", port=settings.app.port, log_level="info")
+	run(app, host="127.0.0.1", port=settings.app.port, log_level="info")
