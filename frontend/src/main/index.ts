@@ -13,6 +13,8 @@ const KEYTAR_SERVICE_NAME = 'NovelForge-LLM'
 // productName / name，本项目 name 为 "frontend"，若不明确定名，数据库与日志会落到
 // ~/Library/Application Support/frontend，而用户按"NovelForge"去找会一无所获。
 app.setName('NovelForge')
+// 再显式钉死路径：不依赖应用名解析规则（bundle 名 / package.json 字段的优先级可能随版本变化）
+app.setPath('userData', join(app.getPath('appData'), 'NovelForge'))
 
 const backendPort = loadBackendPort({
   envFiles: app.isPackaged

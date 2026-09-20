@@ -171,12 +171,12 @@ jobs:
           check_plist "NSAppTransportSecurity:NSAllowsLocalNetworking" "true"
           [ "$FAIL" = 0 ] || exit 1
 
-          echo "--- 应用名称（决定用户数据目录：Application Support/<name>）"
+          echo "--- 应用名称（信息性；用户数据目录的最终裁判是 L3 的实际落盘位置）"
           APP_NAME="$(python3 "$GITHUB_WORKSPACE/.github/ci/app-name.py" "$APP")"
-          echo "  app name = $APP_NAME"
+          echo "  asar package.json 应用名 = $APP_NAME"
           if [ "$APP_NAME" != "NovelForge" ]; then
-            echo "::error::L1 应用名称为 [$APP_NAME]，用户数据会落到错误的目录（期望 NovelForge）"
-            FAIL=1
+            echo "  提示：应用名不是 NovelForge；主进程已显式 setName/setPath 钉死数据目录，"
+            echo "        由 L3 校验数据是否确实落在 Application Support/NovelForge/"
           fi
 
           echo "--- 后端二进制签名（硬断言：我们自己签的，独立文件，校验结果确定）"
@@ -256,9 +256,16 @@ jobs:
             exit 1
           fi
           echo "L2 通过：打包后的后端可启动"
-          if [ -f "$TESTDATA/novelforge.db" ]; then
-            echo "  数据库已创建：$(du -h "$TESTDATA/novelforge.db" | cut -f1)"
+          # 硬断言：NOVELFORGE_DB_PATH 必须生效，否则数据库会写进 App 包内部（只读/更新即丢）
+          if [ ! -f "$TESTDATA/novelforge.db" ]; then
+            echo "::error::L2 失败：后端未按 NOVELFORGE_DB_PATH 在指定位置创建数据库"
+            echo "===== 诊断：本次测试目录 ====="
+            ls -la "$TESTDATA" || true
+            echo "===== 诊断：App 包内是否被写入数据库 ====="
+            find "$APP" -name 'novelforge.db' 2>/dev/null || true
+            exit 1
           fi
+          echo "  数据库已创建：$(du -h "$TESTDATA/novelforge.db" | cut -f1)"
           cleanup_novelforge
 
       # ---------- L3：真实启动路径（拷贝到 /Applications 后用 open 启动，与 Finder 双击同一条路） ----------
@@ -308,8 +315,10 @@ jobs:
             echo "::error::L3 数据库未在用户目录创建：$DB"
             echo "===== 诊断：Application Support 下的目录 ====="
             ls -la "$HOME/Library/Application Support/" 2>/dev/null | head -n 30 || true
-            echo "===== 诊断：实际生成的用户数据目录 ====="
-            find "$HOME/Library/Application Support" -maxdepth 2 -name 'novelforge.db' 2>/dev/null || true
+            echo "===== 诊断：数据库与日志实际落点（全盘搜索）====="
+            find "$HOME/Library/Application Support" -name 'novelforge.db' 2>/dev/null || true
+            find "$HOME/Library/Application Support" -maxdepth 2 -name 'backend.log' 2>/dev/null || true
+            find "$INSTALLED" -name 'novelforge.db' 2>/dev/null || true
             echo "===== 诊断：后端日志 ====="
             tail_backend_log
             exit 1
