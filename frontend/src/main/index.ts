@@ -1,6 +1,6 @@
 import { app, shell, BrowserWindow, session, ipcMain, dialog, clipboard, type WebPreferences } from 'electron'
 import { spawn, spawnSync, type ChildProcess, type StdioOptions } from 'child_process'
-import { appendFileSync, existsSync, mkdirSync, openSync, readFileSync } from 'fs'
+import { appendFileSync, mkdirSync, openSync, readFileSync, statSync } from 'fs'
 import { dirname, join, resolve } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
@@ -23,6 +23,19 @@ const backendOrigin = `http://127.0.0.1:${backendPort}`
 // ============ 打包版后端进程管理 ============
 // 打包后由主进程负责拉起后端；开发模式仍由开发者自行启动后端，这里不做处理。
 let backendProcess: ChildProcess | null = null
+let backendSpawnFailed = false
+
+// 必须是"可执行的普通文件"：PyInstaller 的 onedir 布局下，backend/NovelForgeBackend 是与二进制同名的目录，
+// 只判断 existsSync 会把目录当成可执行文件，spawn 会被系统拒绝（后端因此永远起不来）。
+function isExecutableFile(candidate: string): boolean {
+  try {
+    const stat = statSync(candidate)
+    if (!stat.isFile()) return false
+    return process.platform === 'win32' || (stat.mode & 0o111) !== 0
+  } catch {
+    return false
+  }
+}
 
 function resolveBackendExecutable(): { executable: string; workingDir: string } | null {
   const fileName = process.platform === 'win32' ? 'NovelForgeBackend.exe' : 'NovelForgeBackend'
@@ -34,7 +47,7 @@ function resolveBackendExecutable(): { executable: string; workingDir: string } 
   for (const dir of directories) {
     // 同时兼容 PyInstaller 的 onedir 布局：backend/NovelForgeBackend/NovelForgeBackend
     for (const candidate of [join(dir, fileName), join(dir, 'NovelForgeBackend', fileName)]) {
-      if (existsSync(candidate)) return { executable: candidate, workingDir: dir }
+      if (isExecutableFile(candidate)) return { executable: candidate, workingDir: dir }
     }
   }
   return null
@@ -70,6 +83,7 @@ function startPackagedBackend(): void {
     return
   }
   clearQuarantine()
+  backendSpawnFailed = false
   const env: NodeJS.ProcessEnv = { ...process.env, APP_PORT: String(backendPort) }
   if (process.platform === 'darwin') {
     // macOS：数据库放到用户目录，避免写进 .app 内部（更新/替换应用后数据不丢）
@@ -86,10 +100,14 @@ function startPackagedBackend(): void {
     // 日志文件不可用时不阻塞启动
   }
   backendProcess = spawn(backend.executable, [], { cwd: backend.workingDir, env, stdio })
+  appendBackendLog(`[electron] 启动后端：${backend.executable}\n`)
   backendProcess.on('exit', (code, signal) =>
     appendBackendLog(`[electron] 后端进程退出 code=${code} signal=${signal}\n`)
   )
-  backendProcess.on('error', (error) => appendBackendLog(`[electron] 后端启动失败: ${error}\n`))
+  backendProcess.on('error', (error) => {
+    backendSpawnFailed = true
+    appendBackendLog(`[electron] 后端启动失败: ${error}\n`)
+  })
 }
 
 function stopPackagedBackend(): void {
@@ -103,7 +121,12 @@ async function waitForBackend(timeoutMs = 90_000): Promise<boolean> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     // 后端进程已经退出/没拉起来就不必再等了
-    if (backendProcess === null || backendProcess.exitCode !== null || backendProcess.signalCode) {
+    if (
+      backendSpawnFailed ||
+      backendProcess === null ||
+      backendProcess.exitCode !== null ||
+      backendProcess.signalCode
+    ) {
       return false
     }
     try {
