@@ -1,6 +1,6 @@
-import { app, shell, BrowserWindow, session, ipcMain, dialog, type WebPreferences } from 'electron'
-import { spawn, type ChildProcess, type StdioOptions } from 'child_process'
-import { existsSync, mkdirSync, openSync } from 'fs'
+import { app, shell, BrowserWindow, session, ipcMain, dialog, clipboard, type WebPreferences } from 'electron'
+import { spawn, spawnSync, type ChildProcess, type StdioOptions } from 'child_process'
+import { appendFileSync, existsSync, mkdirSync, openSync, readFileSync } from 'fs'
 import { dirname, join, resolve } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
@@ -40,12 +40,36 @@ function resolveBackendExecutable(): { executable: string; workingDir: string } 
   return null
 }
 
+function backendLogPath(): string {
+  return join(app.getPath('userData'), 'backend.log')
+}
+
+function appendBackendLog(text: string): void {
+  try {
+    appendFileSync(backendLogPath(), text)
+  } catch {
+    // 日志写入失败不影响主流程
+  }
+}
+
+// 启动前清除系统给下载文件打的隔离标记，避免内嵌的后端进程被 Gatekeeper 拦截
+function clearQuarantine(): void {
+  if (process.platform !== 'darwin') return
+  const bundle = resolve(process.execPath, '../..')
+  try {
+    spawnSync('xattr', ['-dr', 'com.apple.quarantine', bundle], { stdio: 'ignore' })
+  } catch {
+    // 尽力而为，失败不阻塞启动
+  }
+}
+
 function startPackagedBackend(): void {
   const backend = resolveBackendExecutable()
   if (!backend) {
     dialog.showErrorBox('NovelForge', '未找到后端程序，请重新下载完整安装包。')
     return
   }
+  clearQuarantine()
   const env: NodeJS.ProcessEnv = { ...process.env, APP_PORT: String(backendPort) }
   if (process.platform === 'darwin') {
     // macOS：数据库放到用户目录，避免写进 .app 内部（更新/替换应用后数据不丢）
@@ -55,14 +79,17 @@ function startPackagedBackend(): void {
   }
   let stdio: StdioOptions = 'ignore'
   try {
-    const logFd = openSync(join(app.getPath('userData'), 'backend.log'), 'a')
+    const logFd = openSync(backendLogPath(), 'a')
     stdio = ['ignore', logFd, logFd]
+    appendBackendLog(`\n===== ${new Date().toLocaleString()} 启动后端 =====\n`)
   } catch {
     // 日志文件不可用时不阻塞启动
   }
   backendProcess = spawn(backend.executable, [], { cwd: backend.workingDir, env, stdio })
-  backendProcess.on('exit', (code) => console.log(`[backend] exited with code ${code}`))
-  backendProcess.on('error', (error) => console.error('[backend] failed to start:', error))
+  backendProcess.on('exit', (code, signal) =>
+    appendBackendLog(`[electron] 后端进程退出 code=${code} signal=${signal}\n`)
+  )
+  backendProcess.on('error', (error) => appendBackendLog(`[electron] 后端启动失败: ${error}\n`))
 }
 
 function stopPackagedBackend(): void {
@@ -75,6 +102,10 @@ function stopPackagedBackend(): void {
 async function waitForBackend(timeoutMs = 90_000): Promise<boolean> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
+    // 后端进程已经退出/没拉起来就不必再等了
+    if (backendProcess === null || backendProcess.exitCode !== null || backendProcess.signalCode) {
+      return false
+    }
     try {
       const response = await fetch(`${backendOrigin}/`)
       if (response.ok) return true
@@ -86,6 +117,17 @@ async function waitForBackend(timeoutMs = 90_000): Promise<boolean> {
   return false
 }
 
+function readBackendLogTail(maxLines = 30): string {
+  try {
+    const lines = readFileSync(backendLogPath(), 'utf8')
+      .split(/\r?\n/)
+      .filter((line) => line.trim())
+    return lines.slice(-maxLines).join('\n') || '(日志为空)'
+  } catch {
+    return '(没有找到日志文件)'
+  }
+}
+
 function webPreferences(): WebPreferences {
   return {
     preload: join(__dirname, '../preload/index.js'),
@@ -95,6 +137,30 @@ function webPreferences(): WebPreferences {
 }
 
 const studioWindows = new Map<string, BrowserWindow>()
+
+// 后端就绪前的过渡窗口，避免"双击后没反应"的困惑
+function createSplashWindow(): BrowserWindow {
+  const splash = new BrowserWindow({
+    width: 420,
+    height: 180,
+    frame: false,
+    resizable: false,
+    alwaysOnTop: true,
+    show: false,
+    backgroundColor: '#f5f7fa',
+    webPreferences: { sandbox: true }
+  })
+  splash.once('ready-to-show', () => splash.show())
+  const page =
+    '<!doctype html><html><head><meta charset="utf-8"></head><body style="margin:0;height:100vh;' +
+    'display:flex;flex-direction:column;align-items:center;justify-content:center;' +
+    "font-family:-apple-system,'PingFang SC',sans-serif;background:#f5f7fa\">" +
+    '<div style="font-size:18px;font-weight:600;color:#303133">NovelForge 启动中…</div>' +
+    '<div style="margin-top:12px;font-size:13px;color:#909399">正在启动本地服务，首次运行需要初始化，请稍候</div>' +
+    '</body></html>'
+  splash.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(page))
+  return splash
+}
 
 function createWindow(): void {
   // Create the browser window.
@@ -172,12 +238,24 @@ app.whenReady().then(async () => {
 
   // 打包版：先拉起后端并等它就绪，再创建窗口，避免界面加载时连不上
   if (app.isPackaged) {
+    const splash = createSplashWindow()
     startPackagedBackend()
-    if (!(await waitForBackend())) {
-      dialog.showErrorBox(
-        'NovelForge',
-        `后端服务启动超时。\n日志文件：${join(app.getPath('userData'), 'backend.log')}`
-      )
+    const ready = await waitForBackend()
+    if (!splash.isDestroyed()) splash.destroy()
+    if (!ready) {
+      const logTail = readBackendLogTail(30)
+      const { response } = await dialog.showMessageBox({
+        type: 'error',
+        title: 'NovelForge 启动失败',
+        message: '后端服务未能启动。点击「复制日志」，把剪贴板内容发给朋友即可',
+        detail: logTail,
+        buttons: ['复制日志', '关闭'],
+        defaultId: 0,
+        cancelId: 1
+      })
+      if (response === 0) {
+        clipboard.writeText(logTail)
+      }
     }
   }
 

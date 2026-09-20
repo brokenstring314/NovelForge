@@ -65,6 +65,7 @@ backend/build
 *.spec
 !backend/NovelForgeBackend.spec
 *.sh
+!.github/ci/*.sh
 *.mako
 
 # Node modules

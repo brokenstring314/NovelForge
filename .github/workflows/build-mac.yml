@@ -4,11 +4,14 @@ name: Build macOS App
 on:
   workflow_dispatch:
 
+env:
+  HEALTH_URL: http://127.0.0.1:54321/
+
 jobs:
   build:
     name: NovelForge (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -25,34 +28,45 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
 
       - name: Build backend with PyInstaller
         working-directory: backend
         run: |
+          set -euo pipefail
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller
           pyinstaller NovelForgeBackend.spec --noconfirm --clean
           # Apple Silicon 上可执行文件必须带有效签名，这里补一个 ad-hoc 签名
-          codesign --force --sign - "dist/NovelForgeBackend/NovelForgeBackend" || true
+          codesign --force --sign - "dist/NovelForgeBackend/NovelForgeBackend"
+          codesign --verify --strict --verbose=2 "dist/NovelForgeBackend/NovelForgeBackend"
 
-      - name: Smoke test backend
+      # ---------- L0：构建目录里的裸后端（最便宜的早拦，先于耗时的前端构建） ----------
+      - name: 'L0: backend smoke test (build dir)'
         working-directory: backend
         run: |
-          ./dist/NovelForgeBackend/NovelForgeBackend > "$RUNNER_TEMP/backend-smoke.log" 2>&1 &
-          BACKEND_PID=$!
+          set -euo pipefail
+          LOG="$RUNNER_TEMP/l0-backend.log"
+          ./dist/NovelForgeBackend/NovelForgeBackend > "$LOG" 2>&1 &
+          PID=$!
           READY=0
           for _ in $(seq 1 90); do
-            if curl -fsS http://127.0.0.1:54321/ > /dev/null 2>&1; then READY=1; break; fi
-            if ! kill -0 "$BACKEND_PID" 2>/dev/null; then break; fi
+            if curl -fsS "$HEALTH_URL" > /dev/null 2>&1; then READY=1; break; fi
+            if ! kill -0 "$PID" 2>/dev/null; then break; fi
             sleep 2
           done
           if [ "$READY" != "1" ]; then
-            echo "::error::后端冒烟测试失败：PyInstaller 可能漏收了依赖"
-            tail -n 120 "$RUNNER_TEMP/backend-smoke.log"
+            echo "::error::L0 失败：PyInstaller 打包的后端无法启动"
+            tail -n 150 "$LOG" || true
             exit 1
           fi
-          echo "后端启动正常"
-          kill "$BACKEND_PID" 2>/dev/null || true
+          echo "L0 通过：构建目录中的后端可启动"
+          kill "$PID" 2>/dev/null || true
+          for _ in $(seq 1 10); do kill -0 "$PID" 2>/dev/null || break; sleep 1; done
+          kill -9 "$PID" 2>/dev/null || true
+          # 清掉冒烟测试产生的数据库，避免被打进 App 包（App 运行时用的是用户目录的库）
+          rm -f dist/NovelForgeBackend/novelforge.db
 
       - name: Setup Node 20
         uses: actions/setup-node@v4
@@ -68,6 +82,7 @@ jobs:
       - name: Generate macOS icon (.icns)
         working-directory: frontend
         run: |
+          set -euo pipefail
           mkdir -p build
           rm -rf icon.iconset
           mkdir -p icon.iconset
@@ -94,22 +109,359 @@ jobs:
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
         run: npx electron-builder --mac --${{ matrix.arch }} --dir
 
-      - name: Ad-hoc sign, zip and dmg
-        working-directory: frontend
+      - name: Locate app bundle
+        id: app
         run: |
-          APP_PATH="$(find dist -maxdepth 3 -type d -name 'NovelForge.app' | head -n 1)"
-          echo "App bundle: $APP_PATH"
+          set -euo pipefail
+          APP_PATH="$(find frontend/dist -maxdepth 3 -type d -name 'NovelForge.app' | head -n 1)"
           if [ -z "$APP_PATH" ]; then
             echo "::error::NovelForge.app not found"
             exit 1
           fi
-          codesign --force --deep --sign - "$APP_PATH" || true
-          codesign --verify --verbose=2 "$APP_PATH" || true
+          APP_ABS="$(cd "$(dirname "$APP_PATH")" && pwd)/$(basename "$APP_PATH")"
+          echo "path=$APP_ABS" >> "$GITHUB_OUTPUT"
+          echo "App bundle: $APP_ABS"
+
+      - name: Prepare test helpers
+        run: |
+          set -euo pipefail
+          chmod +x "$GITHUB_WORKSPACE/.github/ci/mac-helpers.sh"
+          echo "辅助函数就绪：$GITHUB_WORKSPACE/.github/ci/mac-helpers.sh"
+
+      # ---------- L1：包结构与关键二进制签名 ----------
+      - name: 'L1: structure and code signature integrity'
+        run: |
+          set -euo pipefail
+          source "$GITHUB_WORKSPACE/.github/ci/mac-helpers.sh"
+          APP="${{ steps.app.outputs.path }}"
+          FAIL=0
+
+          echo "--- 关键路径"
+          for p in \
+            "$APP/Contents/MacOS/NovelForge" \
+            "$APP/Contents/Resources/app.asar" \
+            "$APP/Contents/backend/.env" \
+            "$APP/Contents/backend/NovelForgeBackend/NovelForgeBackend"; do
+            if [ ! -e "$p" ]; then echo "::error::L1 缺少：$p"; FAIL=1; else echo "  ok: ${p#$APP/}"; fi
+          done
+          [ "$FAIL" = 0 ] || exit 1
+
+          echo "--- 后端二进制可执行权限"
+          if [ -x "$APP/Contents/backend/NovelForgeBackend/NovelForgeBackend" ]; then
+            echo "  ok: 可执行"
+          else
+            echo "::error::L1 后端二进制没有可执行权限"; FAIL=1
+          fi
+
+          echo "--- Info.plist 关键字段"
+          PB=/usr/libexec/PlistBuddy
+          PLIST="$APP/Contents/Info.plist"
+          check_plist() {
+            local key="$1" expect="$2" actual
+            actual="$("$PB" -c "Print :$key" "$PLIST" 2>/dev/null || echo '<缺失>')"
+            if [ "$actual" = "$expect" ]; then
+              echo "  ok: $key = $actual"
+            else
+              echo "::error::L1 Info.plist $key 期望 [$expect] 实际 [$actual]"; FAIL=1
+            fi
+          }
+          check_plist CFBundleIdentifier "com.novelforge.app"
+          check_plist CFBundleIconFile "icon.icns"
+          check_plist LSMinimumSystemVersion "11.0"
+          check_plist "NSAppTransportSecurity:NSAllowsLocalNetworking" "true"
+          [ "$FAIL" = 0 ] || exit 1
+
+          echo "--- 后端二进制签名（硬断言：我们自己签的，独立文件，校验结果确定）"
+          if codesign --verify --strict --verbose=2 "$APP/Contents/backend/NovelForgeBackend/NovelForgeBackend" 2>"$RUNNER_TEMP/cs-err.txt"; then
+            echo "  ok: 后端二进制签名有效"
+          else
+            echo "::error::L1 后端二进制签名无效（会导致真机上进程被系统杀掉）"
+            cat "$RUNNER_TEMP/cs-err.txt" || true
+            FAIL=1
+          fi
+          SIG_INFO="$(codesign -dv --verbose=2 "$APP/Contents/backend/NovelForgeBackend/NovelForgeBackend" 2>&1 || true)"
+          echo "  后端签名信息: $(echo "$SIG_INFO" | grep -E 'Signature|Identifier|TeamIdentifier' | tr '\n' ' ')"
+
+          # Electron 自带二进制只做信息性输出：bundle 未整体签名时 codesign 的判定不稳定，
+          # 硬断言会产生误报；它们能否运行由 L3 真实启动来裁判。
+          echo "--- Electron 二进制签名（信息性）"
+          for bin in \
+            "$APP/Contents/MacOS/NovelForge" \
+            "$APP/Contents/Frameworks/Electron Framework.framework/Versions/A/Electron Framework"; do
+            [ -e "$bin" ] || { echo "  (跳过，不存在) ${bin#$APP/}"; continue; }
+            if codesign --verify --strict "$bin" >/dev/null 2>&1; then
+              echo "  ok: ${bin#$APP/}"
+            else
+              echo "  提示：${bin#$APP/} 未通过严格校验（bundle 未整体签名时属预期，由 L3 裁定）"
+            fi
+          done
+
+          echo "--- 内嵌动态库签名扫描（信息性，真正裁判是 L2 的实际加载）"
+          LIB_TOTAL=0; LIB_UNSIGNED=0; LIB_OTHER=0
+          while IFS= read -r -d '' f; do
+            case "$(file -b "$f")" in
+              *Mach-O*) ;;
+              *) continue ;;
+            esac
+            LIB_TOTAL=$((LIB_TOTAL + 1))
+            if ! ERR="$(codesign --verify "$f" 2>&1)"; then
+              if echo "$ERR" | grep -q "not signed at all"; then
+                LIB_UNSIGNED=$((LIB_UNSIGNED + 1))
+              else
+                LIB_OTHER=$((LIB_OTHER + 1))
+                echo "  注意：${f#$APP/} → $(echo "$ERR" | head -n 1)"
+              fi
+            fi
+          done < <(find "$APP/Contents/backend" -type f -print0)
+          echo "  Mach-O 总数=$LIB_TOTAL 未签名=$LIB_UNSIGNED 其它情况=$LIB_OTHER"
+
+          [ "$FAIL" = 0 ] || exit 1
+          echo "L1 通过：结构与关键二进制签名正常"
+
+      # ---------- L2：包内后端能否真的跑起来（上次翻车的盲区） ----------
+      - name: 'L2: bundled backend runs from inside app'
+        run: |
+          set -euo pipefail
+          source "$GITHUB_WORKSPACE/.github/ci/mac-helpers.sh"
+          APP="${{ steps.app.outputs.path }}"
+          WORK="$APP/Contents/backend/NovelForgeBackend"
+          BIN="$WORK/NovelForgeBackend"
+          TESTDATA="$RUNNER_TEMP/l2-data"
+          LOG="$RUNNER_TEMP/l2-backend.log"
+          rm -rf "$TESTDATA"; mkdir -p "$TESTDATA"
+
+          cleanup_novelforge
+          assert_port_free
+
+          # 完全模拟 Electron 的 spawn：cwd=后端目录 + 环境变量指向用户数据目录
+          ( cd "$WORK" && APP_PORT=54321 NOVELFORGE_DB_PATH="$TESTDATA/novelforge.db" "$BIN" ) > "$LOG" 2>&1 &
+          PID=$!
+          READY=0
+          for _ in $(seq 1 60); do
+            if curl -fsS "$HEALTH_URL" > /dev/null 2>&1; then READY=1; break; fi
+            if ! kill -0 "$PID" 2>/dev/null; then break; fi
+            sleep 2
+          done
+          if [ "$READY" != "1" ]; then
+            echo "::error::L2 失败：打包后的后端无法启动（即“前端能开、后端起不来”的直接原因）"
+            tail -n 200 "$LOG" || true
+            exit 1
+          fi
+          echo "L2 通过：打包后的后端可启动"
+          if [ -f "$TESTDATA/novelforge.db" ]; then
+            echo "  数据库已创建：$(du -h "$TESTDATA/novelforge.db" | cut -f1)"
+          fi
+          cleanup_novelforge
+
+      # ---------- L3：真实启动路径（拷贝到 /Applications 后用 open 启动，与 Finder 双击同一条路） ----------
+      - name: 'L3: real launch path and second launch'
+        run: |
+          set -euo pipefail
+          source "$GITHUB_WORKSPACE/.github/ci/mac-helpers.sh"
+          APP="${{ steps.app.outputs.path }}"
+          INSTALLED="/Applications/NovelForge.app"
+          USERDATA="$HOME/Library/Application Support/NovelForge"
+          DB="$USERDATA/data/novelforge.db"
+
+          cleanup_novelforge
+          rm -rf "$INSTALLED" "$USERDATA"
+          cp -R "$APP" "$INSTALLED"
+          assert_port_free
+
+          # 信息性记录：未签名/未公证的 App 会被 Gatekeeper 拒绝（这正是需要教朋友右键打开的原因）
+          echo "--- Gatekeeper 判定（信息性）"
+          spctl --assess --type execute --verbose=4 "$INSTALLED" 2>&1 || true
+
+          echo "--- 首次启动"
+          if ! launch_app "$INSTALLED" 20; then
+            echo "::error::L3 首次启动后主进程未能运行"
+            echo "===== 诊断：相关进程 ====="
+            pgrep -fl NovelForge || true
+            echo "===== 诊断：LaunchServices ====="
+            lsappinfo list 2>/dev/null | grep -i -B1 -A2 novelforge | head -n 20 || true
+            echo "===== 诊断：直接执行输出 ====="
+            cat "$RUNNER_TEMP/direct-launch.log" 2>/dev/null | tail -n 40 || true
+            echo "===== 诊断：系统日志（最近 2 分钟）====="
+            log show --last 2m --predicate 'process CONTAINS "NovelForge"' 2>/dev/null | tail -n 40 || true
+            echo "===== 诊断：后端日志 ====="
+            tail_backend_log
+            exit 1
+          fi
+          if ! wait_health 150; then
+            echo "::error::L3 首次启动失败：后端未在 150 秒内就绪"
+            echo "===== 诊断：相关进程 ====="
+            pgrep -fl NovelForge || true
+            echo "===== 诊断：后端日志 ====="
+            tail_backend_log
+            exit 1
+          fi
+          echo "  后端已就绪"
+          [ -f "$DB" ] || { echo "::error::L3 数据库未在用户目录创建：$DB"; exit 1; }
+          echo "  数据库已创建：$(du -h "$DB" | cut -f1)"
+          screencapture -x "$RUNNER_TEMP/l3-screenshot.png" 2>/dev/null || true
+
+          echo "--- 退出与子进程回收"
+          osascript -e 'tell application "NovelForge" to quit' > "$RUNNER_TEMP/l3-quit.log" 2>&1 &
+          OSA_PID=$!
+          QUIT_DONE=0
+          for _ in $(seq 1 20); do
+            if ! kill -0 "$OSA_PID" 2>/dev/null; then QUIT_DONE=1; break; fi
+            sleep 1
+          done
+          if [ "$QUIT_DONE" != "1" ]; then
+            echo "::warning::AppleScript 退出超时（CI 无自动化权限属正常），跳过优雅退出检查"
+            kill -9 "$OSA_PID" 2>/dev/null || true
+            cleanup_novelforge
+          elif wait "$OSA_PID"; then
+            RECLAIMED=0
+            for _ in $(seq 1 15); do
+              if ! port_is_busy; then RECLAIMED=1; break; fi
+              sleep 1
+            done
+            if [ "$RECLAIMED" = "1" ]; then
+              echo "  退出后后端已被回收 ✓"
+            else
+              echo "::warning::应用退出后后端进程仍在运行（提示信息，不作为失败）"
+            fi
+          else
+            echo "::warning::AppleScript 退出被系统拒绝（CI 无自动化权限属正常）"
+            cat "$RUNNER_TEMP/l3-quit.log" || true
+            cleanup_novelforge
+          fi
+
+          echo "--- 二次启动（复用已初始化的数据库）"
+          cleanup_novelforge
+          assert_port_free
+          if ! launch_app "$INSTALLED" 20; then
+            echo "::error::L3 二次启动：主进程未能运行"
+            cat "$RUNNER_TEMP/direct-launch.log" 2>/dev/null | tail -n 40 || true
+            tail_backend_log
+            exit 1
+          fi
+          if ! wait_health 120; then
+            echo "::error::L3 二次启动失败（数据库已存在的情况下后端未就绪）"
+            tail_backend_log
+            exit 1
+          fi
+          echo "  二次启动后端已就绪"
+          screencapture -x "$RUNNER_TEMP/l3-second-screenshot.png" 2>/dev/null || true
+
+          cleanup_novelforge
+          rm -rf "$INSTALLED"
+          echo "L3 通过：首次启动、数据落盘、二次启动均正常"
+
+      # ---------- L4：隔离模拟（朋友"下载 dmg → 首次打开"的场景） ----------
+      - name: 'L4: quarantine simulation (friend scenario)'
+        run: |
+          set -euo pipefail
+          source "$GITHUB_WORKSPACE/.github/ci/mac-helpers.sh"
+          APP="${{ steps.app.outputs.path }}"
+          INSTALLED="/Applications/NovelForge.app"
+          USERDATA="$HOME/Library/Application Support/NovelForge"
+
+          cleanup_novelforge
+          rm -rf "$INSTALLED" "$USERDATA"
+          cp -R "$APP" "$INSTALLED"
+
+          count_quarantined() {
+            find "$1" -print0 2>/dev/null | xargs -0 xattr -p com.apple.quarantine 2>/dev/null | wc -l | tr -d ' '
+          }
+
+          echo "--- 模拟浏览器下载：递归打上隔离标记"
+          xattr -r -w com.apple.quarantine "0081;5f000000;Safari;" "$INSTALLED"
+          BEFORE="$(count_quarantined "$INSTALLED")"
+          echo "  带隔离标记的文件数：$BEFORE"
+          if [ "$BEFORE" -lt 100 ]; then
+            echo "::error::L4 前置条件失败：未能模拟出隔离状态"
+            exit 1
+          fi
+
+          echo "--- 执行给朋友的指令：xattr -dr com.apple.quarantine <App>"
+          xattr -dr com.apple.quarantine "$INSTALLED"
+          AFTER="$(count_quarantined "$INSTALLED")"
+          echo "  清理后剩余标记数：$AFTER"
+          if [ "$AFTER" != "0" ]; then
+            echo "::error::L4 失败：xattr 指令未能清除全部隔离标记"
+            exit 1
+          fi
+
+          echo "--- 清理隔离标记后启动"
+          assert_port_free
+          if ! launch_app "$INSTALLED" 20; then
+            echo "::error::L4 失败：主进程未能运行"
+            cat "$RUNNER_TEMP/direct-launch.log" 2>/dev/null | tail -n 40 || true
+            tail_backend_log
+            exit 1
+          fi
+          if ! wait_health 150; then
+            echo "::error::L4 失败：按给朋友的指令处理后仍无法启动"
+            tail_backend_log
+            exit 1
+          fi
+          echo "  后端已就绪"
+          screencapture -x "$RUNNER_TEMP/l4-screenshot.png" 2>/dev/null || true
+
+          cleanup_novelforge
+          rm -rf "$INSTALLED"
+          echo "L4 通过：隔离场景下按说明操作后可正常使用"
+
+      # ---------- 生成对外产物（此时已完成全部验收，测的就是发的这一份） ----------
+      - name: Zip and dmg
+        working-directory: frontend
+        run: |
+          set -euo pipefail
+          APP_PATH="$(find dist -maxdepth 3 -type d -name 'NovelForge.app' | head -n 1)"
+          echo "App bundle: $APP_PATH"
+          # 注意：不要对整个 App 做 --deep 重签名。
+          # Electron 官方二进制自带有效签名，后端二进制已在 PyInstaller 步骤单独 ad-hoc 签名；
+          # 整体重签会破坏内嵌 Python 运行时的签名，导致后端进程启动即被系统杀掉。
           VERSION="$(node -p "require('./package.json').version")"
           ditto -c -k --keepParent "$APP_PATH" "dist/NovelForge-${VERSION}-mac-${{ matrix.arch }}.zip"
           hdiutil create -volname "NovelForge" -srcfolder "$APP_PATH" -ov -format UDZO "dist/NovelForge-${VERSION}-mac-${{ matrix.arch }}.dmg"
 
-      - name: Upload artifacts
+      # ---------- L5：成品 dmg 回读校验 ----------
+      - name: 'L5: dmg read-back'
+        run: |
+          set -euo pipefail
+          VERSION="$(node -p "require('./frontend/package.json').version")"
+          DMG="frontend/dist/NovelForge-${VERSION}-mac-${{ matrix.arch }}.dmg"
+          [ -f "$DMG" ] || { echo "::error::L5 未找到 dmg：$DMG"; exit 1; }
+          MNT="$RUNNER_TEMP/nf-dmg"
+          rm -rf "$MNT"; mkdir -p "$MNT"
+          hdiutil attach "$DMG" -nobrowse -readonly -mountpoint "$MNT"
+          set +e
+          FAIL=0
+          [ -d "$MNT/NovelForge.app" ] || { echo "::error::L5 dmg 中缺少 NovelForge.app"; FAIL=1; }
+          [ -f "$MNT/NovelForge.app/Contents/Resources/app.asar" ] || { echo "::error::L5 dmg 中缺少 app.asar"; FAIL=1; }
+          [ -x "$MNT/NovelForge.app/Contents/backend/NovelForgeBackend/NovelForgeBackend" ] || { echo "::error::L5 dmg 中缺少后端二进制或不可执行"; FAIL=1; }
+          hdiutil detach "$MNT" -quiet
+          set -e
+          [ "$FAIL" = 0 ] || exit 1
+          echo "L5 通过：dmg 内容完整"
+
+      # ---------- 诊断收集（无论成败都上传，避免"拿不到失败日志"） ----------
+      - name: Collect diagnostics
+        if: always()
+        run: |
+          set -uo pipefail
+          DIAG="$RUNNER_TEMP/diagnostics"
+          mkdir -p "$DIAG"
+          cp "$HOME/Library/Application Support/NovelForge/backend.log" "$DIAG/" 2>/dev/null || true
+          cp "$RUNNER_TEMP"/*.log "$DIAG/" 2>/dev/null || true
+          cp "$RUNNER_TEMP"/*.txt "$DIAG/" 2>/dev/null || true
+          cp "$RUNNER_TEMP"/*.png "$DIAG/" 2>/dev/null || true
+          {
+            sw_vers
+            uname -m
+            echo "runner: ${{ matrix.runner }}"
+            echo "arch: ${{ matrix.arch }}"
+            spctl --status || true
+            csrutil status || true
+          } > "$DIAG/system-info.txt" 2>&1
+          echo "--- 诊断文件清单:"
+          ls -la "$DIAG" || true
+
+      - name: Upload app artifacts
         uses: actions/upload-artifact@v4
         with:
           name: NovelForge-mac-${{ matrix.arch }}
@@ -117,4 +469,13 @@ jobs:
             frontend/dist/NovelForge-*-mac-${{ matrix.arch }}.zip
             frontend/dist/NovelForge-*-mac-${{ matrix.arch }}.dmg
           if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostics-${{ matrix.arch }}
+          path: ${{ runner.temp }}/diagnostics
+          if-no-files-found: warn
           retention-days: 30
