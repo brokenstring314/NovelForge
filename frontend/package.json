@@ -1,5 +1,6 @@
 {
   "name": "frontend",
+  "productName": "NovelForge",
   "version": "0.9.7",
   "buildVersion": "0.9.7",
   "description": "Novel Forege",

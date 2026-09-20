@@ -9,6 +9,11 @@ import { loadBackendPort } from '../../scripts/backend-config.mjs'
 
 const KEYTAR_SERVICE_NAME = 'NovelForge-LLM'
 
+// 必须早于任何 getPath('userData')：Electron 的用户数据目录取自 package.json 的
+// productName / name，本项目 name 为 "frontend"，若不明确定名，数据库与日志会落到
+// ~/Library/Application Support/frontend，而用户按"NovelForge"去找会一无所获。
+app.setName('NovelForge')
+
 const backendPort = loadBackendPort({
   envFiles: app.isPackaged
     ? [
