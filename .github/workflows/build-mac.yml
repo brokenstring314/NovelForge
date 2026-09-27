@@ -128,6 +128,44 @@ jobs:
           chmod +x "$GITHUB_WORKSPACE/.github/ci/mac-helpers.sh"
           echo "辅助函数就绪：$GITHUB_WORKSPACE/.github/ci/mac-helpers.sh"
 
+      # ---------- 整体 ad-hoc 签名：决定 Gatekeeper 显示"仍要打开"还是"已损坏" ----------
+      # 无苹果开发者证书时，有效的 ad-hoc 签名让 Gatekeeper 走"无法验证开发者"的
+      # 可绕过路径；签名缺失或无效则直接报"已损坏"，用户没有任何绕过入口。
+      # 后端运行时是否被签名步骤破坏，由后续 L2/L3 的真实启动把关。
+      - name: Ad-hoc sign app bundle
+        run: |
+          set -euo pipefail
+          trap 'rc=$?; echo "::error::签名步骤在未预期的命令处中止：退出码 $rc（约第 $LINENO 行）"' ERR
+          APP="${{ steps.app.outputs.path }}"
+
+          echo "--- 先逐个签名内嵌 Python 运行时（.so/.dylib/后端二进制）"
+          SIGNED=0
+          while IFS= read -r -d '' f; do
+            case "$(file -b "$f")" in
+              *Mach-O*) codesign --force --sign - "$f" 2>/dev/null || true; SIGNED=$((SIGNED + 1)) ;;
+            esac
+          done < <(find "$APP/Contents/backend" -type f -print0)
+          echo "  backend 下的 Mach-O 已处理：$SIGNED 个"
+
+          echo "--- 对整个 App 做 ad-hoc 签名（--deep 覆盖框架与 Helper）"
+          codesign --force --deep --sign - "$APP"
+
+          echo "--- 校验签名有效性（这一项直接决定用户体验到的 Gatekeeper 行为）"
+          if codesign --verify "$APP" 2> "$RUNNER_TEMP/cs-verify.txt"; then
+            echo "  bundle 签名有效：Gatekeeper 将显示可绕过的“无法验证开发者”提示"
+          else
+            echo "::error::整体签名校验失败——真机上会直接报“已损坏”"
+            cat "$RUNNER_TEMP/cs-verify.txt" || true
+            exit 1
+          fi
+
+          echo "--- 深度校验（信息性）"
+          if codesign --verify --deep --strict "$APP" 2>&1; then
+            echo "  --deep --strict 通过"
+          else
+            echo "  提示：--deep --strict 未通过（不判失败；实际能否运行由 L2/L3 裁定）"
+          fi
+
       # ---------- L1：包结构与关键二进制签名 ----------
       - name: 'L1: structure and code signature integrity'
         run: |
@@ -464,9 +502,8 @@ jobs:
           set -euo pipefail
           APP_PATH="$(find dist -maxdepth 3 -type d -name 'NovelForge.app' | head -n 1)"
           echo "App bundle: $APP_PATH"
-          # 注意：不要对整个 App 做 --deep 重签名。
-          # Electron 官方二进制自带有效签名，后端二进制已在 PyInstaller 步骤单独 ad-hoc 签名；
-          # 整体重签会破坏内嵌 Python 运行时的签名，导致后端进程启动即被系统杀掉。
+          # 整体 ad-hoc 签名已在「Ad-hoc sign app bundle」步骤完成并校验；
+          # 后端运行时的完好性由 L2/L3 的真实启动把关。
           VERSION="$(node -p "require('./package.json').version")"
           ditto -c -k --keepParent "$APP_PATH" "dist/NovelForge-${VERSION}-mac-${{ matrix.arch }}.zip"
           hdiutil create -volname "NovelForge" -srcfolder "$APP_PATH" -ov -format UDZO "dist/NovelForge-${VERSION}-mac-${{ matrix.arch }}.dmg"
