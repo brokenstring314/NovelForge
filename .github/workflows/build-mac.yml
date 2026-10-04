@@ -37,6 +37,8 @@ jobs:
           set -euo pipefail
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller
+          # 记录精确的依赖版本：出现"依赖漂移"类故障时可对账（随诊断包上传）
+          python -m pip freeze > "$RUNNER_TEMP/pip-freeze.txt"
           pyinstaller NovelForgeBackend.spec --noconfirm --clean
           # Apple Silicon 上可执行文件必须带有效签名，这里补一个 ad-hoc 签名
           codesign --force --sign - "dist/NovelForgeBackend/NovelForgeBackend"
@@ -295,6 +297,8 @@ jobs:
             exit 1
           fi
           echo "L2 通过：打包后的后端可启动"
+          echo "--- 内置工作流完整性（健康接口不依赖它，必须单独断言）"
+          python3 "$GITHUB_WORKSPACE/.github/ci/verify-workflows.py"
           # 硬断言：NOVELFORGE_DB_PATH 必须生效，否则数据库会写进 App 包内部（只读/更新即丢）
           if [ ! -f "$TESTDATA/novelforge.db" ]; then
             echo "::error::L2 失败：后端未按 NOVELFORGE_DB_PATH 在指定位置创建数据库"
@@ -396,7 +400,10 @@ jobs:
           fi
 
           echo "--- 二次启动（复用已初始化的数据库）"
+          # 关键：必须确认上一个实例已完全退出——若它卡在退出流程中，
+          # `open` 只会唤醒旧实例而非启动新实例，后端永远不会被重新拉起
           cleanup_novelforge
+          assert_no_app_process "$INSTALLED"
           assert_port_free
           if ! launch_app "$INSTALLED" 20; then
             echo "::error::L3 二次启动：主进程未能运行"
@@ -406,10 +413,17 @@ jobs:
           fi
           if ! wait_health 120; then
             echo "::error::L3 二次启动失败（数据库已存在的情况下后端未就绪）"
+            echo "===== 诊断：失败时的屏幕截图 ====="
+            screencapture -x "$RUNNER_TEMP/l3-second-fail-screenshot.png" 2>/dev/null || true
+            echo "===== 诊断：相关进程 ====="
+            ps aux | grep -i novelforge | grep -v grep || true
+            echo "===== 诊断：后端日志 ====="
             tail_backend_log
             exit 1
           fi
           echo "  二次启动后端已就绪"
+          echo "--- 二次启动后内置工作流仍完整"
+          python3 "$GITHUB_WORKSPACE/.github/ci/verify-workflows.py"
           screencapture -x "$RUNNER_TEMP/l3-second-screenshot.png" 2>/dev/null || true
 
           cleanup_novelforge

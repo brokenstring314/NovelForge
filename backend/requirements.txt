@@ -1,7 +1,9 @@
 fastapi
 uvicorn
 json_repair
-sqlmodel
+# 0.0.43 起强制要求 timezone-aware datetime，与本项目全量 naive datetime 用法不兼容
+# （0.0.47 实测导致内置工作流初始化全部失败，CI L3 捕获；0.0.42 实测正常）
+sqlmodel==0.0.42
 alembic
 loguru
 pydantic>=2.11.7

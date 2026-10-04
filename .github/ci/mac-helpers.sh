@@ -28,15 +28,55 @@ assert_port_free() {
 }
 
 cleanup_novelforge() {
+  # 先礼后兵：SIGTERM 给优雅退出留时间，超时后 SIGKILL 强制清理
   pkill -f "$NF_BACKEND_PATTERN" >/dev/null 2>&1 || true
   pkill -f "NovelForge.app/Contents/MacOS/NovelForge" >/dev/null 2>&1 || true
+  pkill -f "NovelForge Helper" >/dev/null 2>&1 || true
   local i=0
-  while [ "$i" -lt 20 ]; do
+  while [ "$i" -lt 8 ]; do
+    port_is_busy || break
+    sleep 1
+    i=$((i + 1))
+  done
+  pkill -9 -f "$NF_BACKEND_PATTERN" >/dev/null 2>&1 || true
+  pkill -9 -f "NovelForge.app/Contents/MacOS/NovelForge" >/dev/null 2>&1 || true
+  pkill -9 -f "NovelForge Helper" >/dev/null 2>&1 || true
+  i=0
+  while [ "$i" -lt 8 ]; do
     port_is_busy || break
     sleep 1
     i=$((i + 1))
   done
   return 0
+}
+
+# 断言 App 主进程已完全退出；退出不干净时强杀。
+# 用途：两次启动之间——若上一个实例卡在退出流程中没死透，
+# `open` 只会"唤醒"旧实例而不是启动新实例，导致后端永远不会被重新拉起。
+assert_no_app_process() {
+  local app="$1" i=0
+  while [ "$i" -lt 15 ]; do
+    if ! app_process_alive "$app"; then
+      echo "  ok：无残留 App 进程"
+      return 0
+    fi
+    sleep 1
+    i=$((i + 1))
+  done
+  echo "::warning::App 主进程未在 15 秒内退出，执行强杀后重试"
+  pkill -9 -f "$app/Contents/MacOS/NovelForge" >/dev/null 2>&1 || true
+  pkill -9 -f "NovelForge Helper" >/dev/null 2>&1 || true
+  i=0
+  while [ "$i" -lt 10 ]; do
+    if ! app_process_alive "$app"; then
+      echo "  ok：强杀后无残留进程"
+      return 0
+    fi
+    sleep 1
+    i=$((i + 1))
+  done
+  echo "::error::App 主进程无法终止，无法进行下一次启动测试"
+  return 1
 }
 
 app_process_alive() {

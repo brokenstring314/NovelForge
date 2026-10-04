@@ -86,7 +86,15 @@ function clearQuarantine(): void {
 function startPackagedBackend(): void {
   const backend = resolveBackendExecutable()
   if (!backend) {
-    dialog.showErrorBox('NovelForge', '未找到后端程序，请重新下载完整安装包。')
+    // 先写日志再提示：弹窗在无人值守环境（CI/后台）可能永远无人点，日志才是可靠证据
+    appendBackendLog('[electron] 未找到后端可执行文件\n')
+    dialog
+      .showMessageBox({
+        type: 'error',
+        title: 'NovelForge',
+        message: '未找到后端程序，请重新下载完整安装包。'
+      })
+      .catch(() => {})
     return
   }
   clearQuarantine()
@@ -268,24 +276,30 @@ app.whenReady().then(async () => {
 
   // 打包版：先拉起后端并等它就绪，再创建窗口，避免界面加载时连不上
   if (app.isPackaged) {
+    appendBackendLog('[electron] 主进程 whenReady，准备启动后端\n')
     const splash = createSplashWindow()
     startPackagedBackend()
     const ready = await waitForBackend()
     if (!splash.isDestroyed()) splash.destroy()
     if (!ready) {
       const logTail = readBackendLogTail(30)
-      const { response } = await dialog.showMessageBox({
-        type: 'error',
-        title: 'NovelForge 启动失败',
-        message: '后端服务未能启动。点击「复制日志」，把剪贴板内容发给朋友即可',
-        detail: logTail,
-        buttons: ['复制日志', '关闭'],
-        defaultId: 0,
-        cancelId: 1
-      })
-      if (response === 0) {
-        clipboard.writeText(logTail)
-      }
+      // 不阻塞：无人值守时（CI）对话框可能永远无人响应，流程要能继续走完
+      dialog
+        .showMessageBox({
+          type: 'error',
+          title: 'NovelForge 启动失败',
+          message: '后端服务未能启动。点击「复制日志」，把剪贴板内容发给朋友即可',
+          detail: logTail,
+          buttons: ['复制日志', '关闭'],
+          defaultId: 0,
+          cancelId: 1
+        })
+        .then(({ response }) => {
+          if (response === 0) {
+            clipboard.writeText(logTail)
+          }
+        })
+        .catch(() => {})
     }
   }
 
